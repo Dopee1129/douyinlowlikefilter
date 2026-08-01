@@ -7,11 +7,7 @@ import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.Gravity;
-import android.view.KeyEvent;
-import android.view.Menu;
-import android.view.MenuItem;
 import android.view.View;
-import android.view.WindowManager;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.TextView;
@@ -20,8 +16,11 @@ import android.widget.Toast;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
+import java.util.WeakHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -33,15 +32,10 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  * 抖音低赞视频过滤模块 - 核心Hook类
  *
  * 配置方案：
- * ★ 彻底放弃 XSharedPreferences（Android 7+ 已无法可靠跨进程读取）
  * ★ 使用抖音自身 Context 的 SharedPreferences 存储配置（不跨进程，100% 可靠）
  * ★ 在抖音设置页面注入设置入口，用户在抖音设置里直接修改阈值
  *
  * SP 文件：由抖音进程持有，存于 /data/data/com.ss.android.ugc.aweme/shared_prefs/dylf_config.xml
- *
- * 操作方式：
- *   打开抖音 -> 我 -> 设置 -> 通用设置，页面底部会出现 "低赞视频过滤" 选项
- *   点击它即可弹出输入框修改过滤阈值，立即生效，无需重启。
  */
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -58,6 +52,9 @@ public class MainHook implements IXposedHookLoadPackage {
     // 保存抖音 Context 供后续使用
     private volatile Context douyinContext = null;
 
+    // 防止同一批 FeedItemList 被重复多次过滤
+    private final Set<Object> processedFeedLists = Collections.newSetFromMap(new WeakHashMap<>());
+
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         if (!lpparam.packageName.equals(DOUYIN_PACKAGE)) return;
@@ -70,33 +67,17 @@ public class MainHook implements IXposedHookLoadPackage {
         // Hook Activity.onCreate，获取抖音 Context，并注入设置入口
         hookActivityForConfig(lpparam);
 
-        // ★ 预加载 Hook：在数据解析阶段拦截（最早时机）
-        try {
-            hookFeedResponseParser(lpparam);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": 预加载 Hook 失败: " + t.getMessage());
-        }
-
-        // 主 Hook 点：过滤低赞视频（兜底）
+        // 主 Hook 点：过滤低赞视频
         try {
             hookFeedItemList(lpparam);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": FeedItemList Hook 失败，尝试备选...");
-            XposedBridge.log(t);
-            tryHookFallback(lpparam);
+            XposedBridge.log(TAG + ": FeedItemList Hook 异常: " + t.getMessage());
         }
 
         try {
             hookFeedModel(lpparam);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": FeedModel Hook 失败（非致命）");
-        }
-
-        // ★ UI 层兜底：Hook RecyclerView.Adapter.onBindViewHolder，隐藏漏网的低赞视频
-        try {
-            hookRecyclerViewAdapter(lpparam);
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": RecyclerView Hook 失败（非致命）: " + t.getMessage());
+            XposedBridge.log(TAG + ": FeedModel Hook 异常");
         }
     }
 
@@ -113,7 +94,6 @@ public class MainHook implements IXposedHookLoadPackage {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                             android.app.Application app = (android.app.Application) param.thisObject;
-                            // 确保是抖音进程
                             if (!app.getPackageName().equals(DOUYIN_PACKAGE)) return;
 
                             if (douyinContext == null) {
@@ -131,82 +111,6 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ★ UI 层兜底：Hook RecyclerView.Adapter.onBindViewHolder
-    //   隐藏所有漏过数据层过滤的低赞视频（包括冷启动缓存数据）
-    // ─────────────────────────────────────────────────────────────
-
-    private void hookRecyclerViewAdapter(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Hook RecyclerView.Adapter.onBindViewHolder(ViewHolder, int)
-        // 注意：只做 View.GONE，不做 remove（Adapter 内 remove 会崩溃）
-        XposedHelpers.findAndHookMethod(
-                androidx.recyclerview.widget.RecyclerView.Adapter.class,
-                "onBindViewHolder",
-                androidx.recyclerview.widget.RecyclerView.ViewHolder.class,
-                int.class,
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        // 只在推荐页生效
-                        if (!isRecommendPage()) return;
-                        if (douyinContext == null) return;
-
-                        androidx.recyclerview.widget.RecyclerView.ViewHolder holder =
-                                (androidx.recyclerview.widget.RecyclerView.ViewHolder) param.args[0];
-
-                        View itemView = holder.itemView;
-
-                        // 已经处理过的跳过
-                        Object tag = itemView.getTag(R.id.dylf_filter_tag);
-                        if (Boolean.TRUE.equals(tag)) return;
-
-                        // 尝试从 ViewHolder 中取出对应的数据对象
-                        try {
-                            long diggCount = getDiggCountFromViewHolder(holder);
-                            if (diggCount > 0 && diggCount < cachedMinLike) {
-                                itemView.setVisibility(View.GONE);
-                                XposedBridge.log(TAG + ": [UI层] 隐藏低赞视频，点赞数=" + diggCount);
-                            } else {
-                                // 确保之前被隐藏的 ViewHolder 被复用时恢复可见
-                                itemView.setVisibility(View.VISIBLE);
-                            }
-                        } catch (Throwable ignored) {
-                            // 无法获取点赞数，不处理
-                        }
-                        // 标记已处理，避免重复处理
-                        itemView.setTag(R.id.dylf_filter_tag, Boolean.TRUE);
-                    }
-                }
-        );
-        XposedBridge.log(TAG + ": RecyclerView.Adapter Hook 成功");
-    }
-
-    /**
-     * 尝试从 ViewHolder 中获取点赞数
-     * 抖音的 ViewHolder 通常持有数据对象（aweme / model 字段）
-     */
-    private long getDiggCountFromViewHolder(androidx.recyclerview.widget.RecyclerView.ViewHolder holder) {
-        // 反射遍历 ViewHolder 字段，找到可能的数据对象
-        Class<?> clz = holder.getClass();
-        while (clz != null && !clz.equals(androidx.recyclerview.widget.RecyclerView.ViewHolder.class)) {
-            for (Field f : clz.getDeclaredFields()) {
-                String name = f.getName().toLowerCase();
-                // 找到可能是视频数据的字段
-                if (name.contains("aweme") || name.contains("model") || name.contains("item") || name.contains("data")) {
-                    try {
-                        f.setAccessible(true);
-                        Object val = f.get(holder);
-                        if (val == null) continue;
-                        long digg = getDiggCount(val);
-                        if (digg >= 0) return digg;
-                    } catch (Throwable ignored) {}
-                }
-            }
-            clz = clz.getSuperclass();
-        }
-        return -1; // 找不到
-    }
-
-    // ─────────────────────────────────────────────────────────────
     // ★ 核心：Hook Activity.onCreate，获取 Context + 注入设置悬浮按钮
     // ─────────────────────────────────────────────────────────────
 
@@ -221,17 +125,14 @@ public class MainHook implements IXposedHookLoadPackage {
                         Activity activity = (Activity) param.thisObject;
                         String activityName = activity.getClass().getName();
 
-                        // 只在抖音 Activity 处理
                         if (!activityName.contains("com.ss.android.ugc.aweme")) return;
 
-                        // 首次获取 Context 时初始化缓存
                         if (douyinContext == null) {
                             douyinContext = activity.getApplicationContext();
                             cachedMinLike = readMinLikeFromSP(douyinContext);
                             XposedBridge.log(TAG + ": 首次初始化，读取配置 min_like_count = " + cachedMinLike);
                         }
 
-                        // 在通用设置页面注入设置入口
                         if (activityName.contains("SettingCommonProtocolActivity")
                                 || activityName.contains("CommonSettingActivity")) {
                             injectSettingToSettingPage(activity);
@@ -243,190 +144,22 @@ public class MainHook implements IXposedHookLoadPackage {
         XposedBridge.log(TAG + ": Activity.onCreate Hook 成功");
     }
 
-    /**
-     * 在抖音通用设置页面注入低赞过滤设置项
-     * 尝试在设置列表中添加一个选项，点击弹出设置 Dialog
-     */
     private void injectSettingToSettingPage(Activity activity) {
         try {
-            XposedBridge.log(TAG + ": 尝试在设置页注入入口，Activity=" + activity.getClass().getName());
-
-            // 延迟执行，等待页面布局完成
             activity.getWindow().getDecorView().postDelayed(() -> {
                 try {
-                    injectSettingItem(activity);
+                    injectFloatingButtonInSetting(activity);
                 } catch (Throwable t) {
                     XposedBridge.log(TAG + ": 延迟注入失败: " + t.getMessage());
-                    // 兜底：使用悬浮按钮方式
-                    injectFloatingButtonInSetting(activity);
                 }
             }, 500);
-
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": 注入设置入口失败: " + t.getMessage());
         }
     }
 
-    /**
-     * 尝试在设置列表中注入设置项
-     */
-    private void injectSettingItem(Activity activity) {
-        try {
-            View decorView = activity.getWindow().getDecorView();
-
-            // 避免重复注入
-            if (decorView.findViewWithTag("dylf_setting_item") != null) {
-                return;
-            }
-
-            // 查找设置列表的 RecyclerView 或 ListView
-            View targetList = findSettingList(decorView);
-            if (targetList == null) {
-                XposedBridge.log(TAG + ": 未找到设置列表，使用兜底方案");
-                injectFloatingButtonInSetting(activity);
-                return;
-            }
-
-            // 创建设置项视图
-            View settingItem = createSettingItemView(activity);
-            settingItem.setTag("dylf_setting_item");
-
-            // 尝试添加到列表
-            if (addViewToList(targetList, settingItem)) {
-                XposedBridge.log(TAG + ": 设置项已注入到设置列表");
-            } else {
-                XposedBridge.log(TAG + ": 添加到列表失败，使用兜底方案");
-                injectFloatingButtonInSetting(activity);
-            }
-
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": 注入设置项失败: " + t.getMessage());
-            injectFloatingButtonInSetting(activity);
-        }
-    }
-
-    /**
-     * 查找设置页面的列表视图（RecyclerView 或 ListView）
-     */
-    private View findSettingList(View root) {
-        try {
-            // 尝试通过类名查找 RecyclerView
-            return findViewByClassName(root, "androidx.recyclerview.widget.RecyclerView");
-        } catch (Throwable t) {
-            // 尝试查找 ListView
-            try {
-                return findViewByClassName(root, "android.widget.ListView");
-            } catch (Throwable ignored) {}
-        }
-        return null;
-    }
-
-    /**
-     * 递归查找指定类名的 View
-     */
-    private View findViewByClassName(View view, String className) {
-        if (view.getClass().getName().equals(className)) {
-            return view;
-        }
-        if (view instanceof android.view.ViewGroup) {
-            android.view.ViewGroup vg = (android.view.ViewGroup) view;
-            for (int i = 0; i < vg.getChildCount(); i++) {
-                View found = findViewByClassName(vg.getChildAt(i), className);
-                if (found != null) return found;
-            }
-        }
-        return null;
-    }
-
-    /**
-     * 尝试将视图添加到列表中
-     */
-    private boolean addViewToList(View list, View item) {
-        try {
-            // 如果是 RecyclerView，尝试通过 Adapter 添加
-            String className = list.getClass().getName();
-            if (className.contains("RecyclerView")) {
-                // 对于 RecyclerView，我们改为在页面底部添加一个固定区域
-                return false; // 暂时返回失败，使用兜底方案
-            }
-            // 如果是 ListView，直接添加
-            if (list instanceof android.widget.ListView) {
-                // ListView 不支持直接 addView
-                return false;
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": 添加到列表异常: " + t.getMessage());
-        }
-        return false;
-    }
-
-    /**
-     * 创建设置项视图
-     */
-    private View createSettingItemView(Activity activity) {
-        // 创建一个类似抖音设置项的 LinearLayout
-        android.widget.LinearLayout container = new android.widget.LinearLayout(activity);
-        container.setOrientation(android.widget.LinearLayout.VERTICAL);
-        container.setBackgroundColor(0xFFFFFFFF);
-        container.setPadding(0, 0, 0, 0);
-
-        // 创建可点击的行
-        android.widget.LinearLayout row = new android.widget.LinearLayout(activity);
-        row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
-        row.setPadding(48, 36, 48, 36);
-        row.setGravity(android.view.Gravity.CENTER_VERTICAL);
-        // 使用 TypedArray 获取 selectableItemBackground 资源 ID
-        android.util.TypedValue typedValue = new android.util.TypedValue();
-        activity.getTheme().resolveAttribute(android.R.attr.selectableItemBackground, typedValue, true);
-        row.setBackgroundResource(typedValue.resourceId);
-
-        // 左侧标题
-        TextView title = new TextView(activity);
-        title.setText("低赞视频过滤");
-        title.setTextSize(16f);
-        title.setTextColor(0xFF333333);
-        android.widget.LinearLayout.LayoutParams titleLp = new android.widget.LinearLayout.LayoutParams(
-                0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        row.addView(title, titleLp);
-
-        // 右侧当前值
-        TextView value = new TextView(activity);
-        value.setText(cachedMinLike + "赞以下");
-        value.setTextSize(14f);
-        value.setTextColor(0xFF999999);
-        row.addView(value);
-
-        // 右侧箭头
-        TextView arrow = new TextView(activity);
-        arrow.setText(" >");
-        arrow.setTextSize(14f);
-        arrow.setTextColor(0xFFCCCCCC);
-        row.addView(arrow);
-
-        container.addView(row, new android.widget.LinearLayout.LayoutParams(
-                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
-                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        // 添加分隔线
-        View divider = new View(activity);
-        divider.setBackgroundColor(0xFFE5E5E5);
-        android.widget.LinearLayout.LayoutParams dividerLp = new android.widget.LinearLayout.LayoutParams(
-                android.widget.LinearLayout.LayoutParams.MATCH_PARENT, 1);
-        dividerLp.leftMargin = 48;
-        container.addView(divider, dividerLp);
-
-        // 点击事件
-        row.setOnClickListener(v -> showSettingDialog(activity, value));
-
-        return container;
-    }
-
-    /**
-     * 兜底方案：在设置页面底部添加一个固定的设置区域
-     */
     private void injectFloatingButtonInSetting(Activity activity) {
         try {
-            // 避免重复注入
             if (activity.getWindow().getDecorView().findViewWithTag("dylf_setting_btn") != null) {
                 return;
             }
@@ -437,7 +170,6 @@ public class MainHook implements IXposedHookLoadPackage {
             container.setBackgroundColor(0xFFFFFFFF);
             container.setPadding(48, 36, 48, 36);
 
-            // 标题行
             android.widget.LinearLayout row = new android.widget.LinearLayout(activity);
             row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
             row.setGravity(android.view.Gravity.CENTER_VERTICAL);
@@ -458,7 +190,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
             container.addView(row);
 
-            // 说明文字
             TextView desc = new TextView(activity);
             desc.setText("点击设置过滤阈值，低于此值的视频将被过滤");
             desc.setTextSize(12f);
@@ -466,10 +197,8 @@ public class MainHook implements IXposedHookLoadPackage {
             desc.setPadding(0, 8, 0, 0);
             container.addView(desc);
 
-            // 点击事件
             container.setOnClickListener(v -> showSettingDialog(activity, value));
 
-            // 添加到 DecorView 底部
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.WRAP_CONTENT
@@ -486,16 +215,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * 弹出设置 Dialog：输入新阈值，点确定立即生效并持久化
-     */
-    private void showSettingDialog(Activity activity) {
-        showSettingDialog(activity, null);
-    }
-
-    /**
-     * 弹出设置 Dialog，并更新指定的值显示视图
-     */
     private void showSettingDialog(Activity activity, TextView valueView) {
         try {
             EditText input = new EditText(activity);
@@ -504,7 +223,6 @@ public class MainHook implements IXposedHookLoadPackage {
             input.setText(String.valueOf(cachedMinLike));
             input.selectAll();
 
-            // 给 EditText 加点 padding
             FrameLayout container = new FrameLayout(activity);
             FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
@@ -526,11 +244,8 @@ public class MainHook implements IXposedHookLoadPackage {
                                 Toast.makeText(activity, "请输入非负整数", Toast.LENGTH_SHORT).show();
                                 return;
                             }
-                            // 更新内存缓存（立即生效）
                             cachedMinLike = newVal;
-                            // 持久化到抖音自己的 SP（同进程，无跨进程问题）
                             writeMinLikeToSP(activity.getApplicationContext(), newVal);
-                            // 更新显示
                             if (valueView != null) {
                                 valueView.setText(newVal + "赞以下");
                             }
@@ -584,7 +299,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ★ 过滤逻辑
+    // ★ 过滤逻辑：优化无死锁连刷与单次过滤防重
     // ─────────────────────────────────────────────────────────────
 
     private void hookFeedItemList(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -595,7 +310,6 @@ public class MainHook implements IXposedHookLoadPackage {
         };
         String[] methodNames = {"getItems", "getItemsP", "getItemsNotNull", "getAwemeList", "getList"};
 
-        int hookedCount = 0;
         for (String className : classNames) {
             for (String methodName : methodNames) {
                 try {
@@ -606,46 +320,21 @@ public class MainHook implements IXposedHookLoadPackage {
                             new XC_MethodHook() {
                                 @Override
                                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                                    if (!isRecommendPage()) return;
-
                                     List<?> list = (List<?>) param.getResult();
                                     if (list == null || list.isEmpty()) return;
-
-                                    int minLike = cachedMinLike;
-                                    XposedBridge.log(TAG + ": [FeedItemList." + param.method.getName() + "] 触发过滤，当前阈值 = " + minLike + "，列表数量 = " + list.size());
 
                                     if (!isModifiableList(list)) {
                                         list = new ArrayList<>(list);
                                         param.setResult(list);
                                     }
 
-                                    int removedCount = 0;
-                                    Iterator<?> it = list.iterator();
-                                    while (it.hasNext()) {
-                                        Object aweme = it.next();
-                                        if (aweme == null) continue;
-                                        try {
-                                            long diggCount = getDiggCount(aweme);
-                                            if (diggCount >= 0 && diggCount < minLike) {
-                                                it.remove();
-                                                removedCount++;
-                                                XposedBridge.log(TAG + ": 过滤视频，点赞数=" + diggCount + " < " + minLike);
-                                            }
-                                        } catch (Throwable ignored) {}
-                                    }
-
-                                    if (removedCount > 0) {
-                                        XposedBridge.log(TAG + ": 本次过滤 " + removedCount + " 个低赞视频，剩余 " + list.size() + " 个");
-                                    }
+                                    filterAwemeList(param.thisObject, list);
                                 }
                             }
                     );
-                    hookedCount++;
-                    XposedBridge.log(TAG + ": Hook 成功 -> " + className + "." + methodName + "()");
                 } catch (Throwable ignored) {}
             }
         }
-        XposedBridge.log(TAG + ": FeedItemList 完成注册 " + hookedCount + " 个 Hook 点");
     }
 
     private void hookFeedModel(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -661,124 +350,57 @@ public class MainHook implements IXposedHookLoadPackage {
                         XposedBridge.hookMethod(m, new XC_MethodHook() {
                             @Override
                             protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                                if (!isRecommendPage()) return;
                                 List<?> list = (List<?>) param.getResult();
                                 if (list == null || list.isEmpty()) return;
-                                int minLike = cachedMinLike;
+
                                 if (!isModifiableList(list)) {
                                     list = new ArrayList<>(list);
                                     param.setResult(list);
                                 }
-                                Iterator<?> it = list.iterator();
-                                while (it.hasNext()) {
-                                    Object aweme = it.next();
-                                    if (aweme == null) continue;
-                                    try {
-                                        long diggCount = getDiggCount(aweme);
-                                        if (diggCount >= 0 && diggCount < minLike) {
-                                            it.remove();
-                                            XposedBridge.log(TAG + ": [FeedModel] 过滤，点赞数=" + diggCount + " < " + minLike);
-                                        }
-                                    } catch (Throwable ignored) {}
-                                }
+
+                                filterAwemeList(param.thisObject, list);
                             }
                         });
-                        XposedBridge.log(TAG + ": FeedModel Hook 成功 -> " + className + "." + m.getName() + "()");
                     }
                 }
             } catch (Throwable ignored) {}
         }
     }
 
-    private void tryHookFallback(XC_LoadPackage.LoadPackageParam lpparam) {
-        XposedBridge.log(TAG + ": 尝试 Gson 兜底方案...");
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "com.google.gson.Gson",
-                    lpparam.classLoader,
-                    "fromJson",
-                    String.class,
-                    Class.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                            Object result = param.getResult();
-                            if (result == null) return;
-                            String name = result.getClass().getName();
-                            if ((name.contains("Feed") || name.contains("AwemeList")) && result instanceof List) {
-                                filterListDirect((List<?>) result);
-                            }
-                        }
-                    }
-            );
-            XposedBridge.log(TAG + ": Gson Hook 成功（兜底）");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": 兜底方案失败: " + t.getMessage());
-        }
-    }
-
-    // ─────────────────────────────────────────────────────────────
-    // ★ 预加载拦截：Hook 网络响应解析，在数据填充前过滤
-    // ─────────────────────────────────────────────────────────────
-
-    private void hookFeedResponseParser(XC_LoadPackage.LoadPackageParam lpparam) {
-        XposedBridge.log(TAG + ": 尝试 Hook Feed 响应解析...");
-
-        try {
-            Class<?> responseClass = XposedHelpers.findClass(
-                    "com.ss.android.ugc.aweme.feed.model.FeedResponse", lpparam.classLoader);
-
-            XposedHelpers.findAndHookConstructor(responseClass, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                    filterFeedResponse(param.thisObject);
-                }
-            });
-            XposedBridge.log(TAG + ": FeedResponse 构造函数 Hook 成功");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": FeedResponse Hook 失败: " + t.getMessage());
-        }
-    }
-
-    private void filterFeedResponse(Object feedResponse) {
-        try {
-            if (!isRecommendPageFromResponse(feedResponse)) return;
-
-            List<?> items = null;
-            try {
-                items = (List<?>) XposedHelpers.getObjectField(feedResponse, "items");
-            } catch (Throwable ignored) {}
-
-            if (items == null) {
-                try {
-                    items = (List<?>) XposedHelpers.getObjectField(feedResponse, "awemeList");
-                } catch (Throwable ignored) {}
-            }
-
-            if (items == null) {
-                try {
-                    items = (List<?>) XposedHelpers.getObjectField(feedResponse, "data");
-                } catch (Throwable ignored) {}
-            }
-
-            if (items != null && !items.isEmpty()) {
-                filterListAtParser(items, "FeedResponse");
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": 过滤 FeedResponse 失败: " + t.getMessage());
-        }
-    }
-
+    /**
+     * 核心过滤算法：
+     * 1. 过滤低于 minLike 的视频
+     * 2. 防止整批视频全被滤空导致抖音客户端死锁无法滑动：若该批次全低于阈值，保留该批中点赞最高的一个视频，确保可滑动并触发下一页加载
+     * 3. 同一 FeedItemList 实例仅处理一次，避免重复遍历
+     */
     @SuppressWarnings("unchecked")
-    private void filterListAtParser(List<?> list, String source) {
+    private void filterAwemeList(Object feedItemList, List<?> list) {
         if (list == null || list.isEmpty()) return;
+        if (!isRecommendPage()) return;
 
-        if (!isLikelyRecommendFeed()) return;
+        if (feedItemList != null && processedFeedLists.contains(feedItemList)) {
+            return;
+        }
 
         int minLike = cachedMinLike;
-        int removedCount = 0;
-        int totalCount = list.size();
+        if (minLike <= 0) return;
 
+        int originalSize = list.size();
+        long maxDiggFound = -1;
+        Object bestAweme = null;
+
+        for (Object aweme : list) {
+            if (aweme == null) continue;
+            try {
+                long digg = getDiggCount(aweme);
+                if (digg > maxDiggFound) {
+                    maxDiggFound = digg;
+                    bestAweme = aweme;
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        int removedCount = 0;
         Iterator<?> it = list.iterator();
         while (it.hasNext()) {
             Object aweme = it.next();
@@ -792,54 +414,26 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {}
         }
 
-        if (removedCount > 0) {
-            XposedBridge.log(TAG + ": [预加载] " + source + " 过滤 " + removedCount + "/" + totalCount + " 个低赞视频");
+        // 兜底策略：如果整批视频全部低于阈值，保留该批次中点赞最高的那个视频
+        if (list.isEmpty() && bestAweme != null) {
+            ((List<Object>) list).add(bestAweme);
+            XposedBridge.log(TAG + ": [防卡死] 本批 " + originalSize + " 个视频全部低于 " + minLike + " 赞，保留最高赞视频(点赞=" + maxDiggFound + ")");
+        } else if (removedCount > 0) {
+            XposedBridge.log(TAG + ": 过滤 " + removedCount + "/" + originalSize + " 个低赞视频，剩余 " + list.size() + " 个");
         }
-    }
 
-    private boolean isRecommendPageFromResponse(Object response) {
-        return true;
-    }
-
-    private boolean isLikelyRecommendFeed() {
-        return isRecommendPage();
-    }
-
-    private void filterListDirect(List<?> list) {
-        if (!isRecommendPage()) return;
-        if (list == null || list.isEmpty()) return;
-        int minLike = cachedMinLike;
-        Iterator<?> it = list.iterator();
-        while (it.hasNext()) {
-            Object aweme = it.next();
-            if (aweme == null) continue;
-            try {
-                long diggCount = getDiggCount(aweme);
-                if (diggCount >= 0 && diggCount < minLike) {
-                    it.remove();
-                    XposedBridge.log(TAG + ": [Gson兜底] 过滤，点赞数=" + diggCount + " < " + minLike);
-                }
-            } catch (Throwable ignored) {}
+        if (feedItemList != null) {
+            processedFeedLists.add(feedItemList);
         }
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ★ 工具方法：适配 39.8.0 混淆与调用栈
+    // ★ 工具方法
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * 适配最新版抖音（如 39.8.0）获取视频点赞数
-     * 1. 尝试直接获取 aweme.getDiggCount() / aweme.diggCount
-     * 2. 获取 aweme.statistics (AwemeStatistics)
-     * 3. 尝试 statistics.getDiggCount() / statistics.diggCount
-     * 4. 尝试 39.8.0 混淆方法 statistics.LIZIZ()
-     * 5. 尝试 39.8.0 混淆字段 statistics.b (long)
-     * 6. 反射遍历 long 字段兜底
-     */
     private long getDiggCount(Object aweme) throws Throwable {
         if (aweme == null) return -1;
 
-        // 1. Direct Aweme field / method
         try {
             Method m = aweme.getClass().getMethod("getDiggCount");
             Object r = m.invoke(aweme);
@@ -850,7 +444,6 @@ public class MainHook implements IXposedHookLoadPackage {
             return XposedHelpers.getLongField(aweme, "diggCount");
         } catch (Throwable ignored) {}
 
-        // 2. AwemeStatistics
         Object statistics = null;
         try {
             statistics = XposedHelpers.getObjectField(aweme, "statistics");
@@ -863,19 +456,16 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if (statistics == null) return -1;
 
-        // 2a. statistics.getDiggCount()
         try {
             Method m = statistics.getClass().getMethod("getDiggCount");
             Object r = m.invoke(statistics);
             if (r instanceof Number) return ((Number) r).longValue();
         } catch (Throwable ignored) {}
 
-        // 2b. statistics.diggCount
         try {
             return XposedHelpers.getLongField(statistics, "diggCount");
         } catch (Throwable ignored) {}
 
-        // 2c. 抖音 39.8.0 混淆 getter: LIZIZ()
         try {
             Method m = statistics.getClass().getMethod("LIZIZ");
             if (m.getReturnType() == long.class || m.getReturnType() == Long.class) {
@@ -884,7 +474,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         } catch (Throwable ignored) {}
 
-        // 2d. 抖音 39.8.0 混淆字段: b (long)
         try {
             Field f = statistics.getClass().getDeclaredField("b");
             f.setAccessible(true);
@@ -894,7 +483,6 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         } catch (Throwable ignored) {}
 
-        // 2e. 兜底反射遍历
         try {
             for (Field field : statistics.getClass().getDeclaredFields()) {
                 field.setAccessible(true);
@@ -921,12 +509,6 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * 判断是否是推荐页（基于调用栈分析）
-     * 针对 39.8.0 混淆优化：
-     * 如果调用栈明确出现 search/profile/following/favorite 等非推荐页特征，则排除；
-     * 若未出现排除特征（包括混淆/异步后台线程调用栈），默认认为是推荐页并允许过滤。
-     */
     private boolean isRecommendPage() {
         try {
             StackTraceElement[] stack = Thread.currentThread().getStackTrace();
@@ -940,7 +522,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 }
             }
-            // 异步后台线程或混淆调用栈下默认允许过滤
             return true;
         } catch (Throwable t) {
             return true;
