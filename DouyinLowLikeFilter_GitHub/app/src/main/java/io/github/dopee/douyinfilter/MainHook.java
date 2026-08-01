@@ -359,13 +359,23 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    // 动态预加载缓冲：根据阈值自动调整后台缓冲大小，高阈值下扩容缓冲深度，彻底消除网络加载等待
+    private int getTargetRetainCount(int minLike) {
+        if (minLike >= 5000) {
+            return 4; // 高阈值 (>=5000): 4 个视频深度缓冲 (~40秒观看窗口)，确保后台 HTTP 请求 100% 提前完成
+        } else if (minLike >= 2000) {
+            return 3;
+        } else {
+            return 2;
+        }
+    }
+
     /**
      * 核心过滤算法：
      * 1. 分流达标 (>= minLike) 与低赞 (< minLike) 视频
      * 2. 低赞视频按点赞数降序排列
-     * 3. 预加载缓冲保持：确保每次给播放器至少保留 MIN_RETAIN_COUNT (2) 个视频
-     *    当本批达标视频不足 2 个时，自动补充低赞列表中相对最高赞的视频作为缓冲桥梁，
-     *    使得抖音底层预加载引擎（Preloader）能够持续缓冲下一条视频，彻底解决滑动卡顿转圈问题！
+     * 3. 动态预加载缓冲保持：确保每次给播放器保留足够的缓冲队列，
+     *    使得抖音底层预加载引擎能够在用户观看期间在后台提前下载完下一批数据，彻底做到无感滑动！
      */
     @SuppressWarnings("unchecked")
     private void filterAwemeList(XC_MethodHook.MethodHookParam param, List<?> originalList) {
@@ -413,7 +423,7 @@ public class MainHook implements IXposedHookLoadPackage {
         // 构造 final 输出 list
         List<Object> newList = new ArrayList<>(qualified);
 
-        int targetRetain = Math.min(MIN_RETAIN_COUNT, originalSize);
+        int targetRetain = Math.min(getTargetRetainCount(minLike), originalSize);
         int needed = targetRetain - newList.size();
 
         if (needed > 0 && !lowLike.isEmpty()) {
@@ -425,7 +435,7 @@ public class MainHook implements IXposedHookLoadPackage {
         int removedCount = originalSize - newList.size();
 
         if (removedCount > 0) {
-            XposedBridge.log(TAG + ": [预加载优化] 本批 " + originalSize + " 个视频，达标 " + qualified.size() + " 个，补充最高赞 " + Math.max(0, needed) + " 个缓冲，最终过滤 " + removedCount + " 个，保留 " + newList.size() + " 个");
+            XposedBridge.log(TAG + ": [动态预加载优化] 本批 " + originalSize + " 个视频，达标 " + qualified.size() + " 个，补充最高赞 " + Math.max(0, needed) + " 个缓冲，最终过滤 " + removedCount + " 个，保留 " + newList.size() + " 个");
         }
 
         if (removedCount > 0) {
