@@ -46,9 +46,6 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KEY_MIN_LIKE = "min_like_count";
     private static final int DEFAULT_MIN_LIKE = 1000;
 
-    // 预加载缓冲保持数量：至少保留 3 个视频给播放器进行后台预缓冲，彻底消除高阈值下由于预加载队列过短导致的等待
-    private static final int MIN_RETAIN_COUNT = 3;
-
     // 运行时缓存（避免每次过滤都读磁盘）
     private volatile int cachedMinLike = DEFAULT_MIN_LIKE;
     // 保存抖音 Context 供后续使用
@@ -301,7 +298,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ★ 过滤逻辑：智能预加载缓冲 + 全新 List 构建
+    // ★ 过滤逻辑：极度严格过滤 + 深度继承链点赞数精准解析
     // ─────────────────────────────────────────────────────────────
 
     private void hookFeedItemList(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -359,23 +356,12 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // 动态预加载缓冲：根据阈值自动调整后台缓冲大小，高阈值下扩容缓冲深度，彻底消除网络加载等待
-    private int getTargetRetainCount(int minLike) {
-        if (minLike >= 5000) {
-            return 4; // 高阈值 (>=5000): 4 个视频深度缓冲 (~40秒观看窗口)，确保后台 HTTP 请求 100% 提前完成
-        } else if (minLike >= 2000) {
-            return 3;
-        } else {
-            return 2;
-        }
-    }
-
     /**
-     * 核心过滤算法：
-     * 1. 分流达标 (>= minLike) 与低赞 (< minLike) 视频
-     * 2. 低赞视频按点赞数降序排列
-     * 3. 动态预加载缓冲保持：确保每次给播放器保留足够的缓冲队列，
-     *    使得抖音底层预加载引擎能够在用户观看期间在后台提前下载完下一批数据，彻底做到无感滑动！
+     * 极度严格过滤算法：
+     * 1. 严格判断 diggCount >= minLike
+     * 2. 只有在精准读取到点赞数且 >= minLike 时，才加入 qualified 列表
+     * 3. 针对读取失败 (diggCount < 0) 的项目，仅放行广告或直播间等非视频卡片
+     * 4. 只要有达标视频，绝不混入任何低于阈值的视频！
      */
     @SuppressWarnings("unchecked")
     private void filterAwemeList(XC_MethodHook.MethodHookParam param, List<?> originalList) {
@@ -399,17 +385,18 @@ public class MainHook implements IXposedHookLoadPackage {
             if (aweme == null) continue;
             try {
                 long diggCount = getDiggCount(aweme);
-                if (diggCount >= minLike || diggCount < 0) {
+                if (diggCount >= minLike) {
+                    qualified.add(aweme);
+                } else if (diggCount < 0 && isSpecialNonVideoItem(aweme)) {
                     qualified.add(aweme);
                 } else {
                     lowLike.add(aweme);
                 }
             } catch (Throwable t) {
-                qualified.add(aweme);
+                lowLike.add(aweme);
             }
         }
 
-        // 按点赞数从高到低排序 lowLike
         Collections.sort(lowLike, (a, b) -> {
             try {
                 long diggA = getDiggCount(a);
@@ -420,22 +407,20 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         });
 
-        // 构造 final 输出 list
         List<Object> newList = new ArrayList<>(qualified);
 
-        int targetRetain = Math.min(getTargetRetainCount(minLike), originalSize);
-        int needed = targetRetain - newList.size();
-
-        if (needed > 0 && !lowLike.isEmpty()) {
-            for (int i = 0; i < Math.min(needed, lowLike.size()); i++) {
-                newList.add(lowLike.get(i));
-            }
+        // 极度严格模式防死锁：仅当整个批次无一视频达标时，才保留本批最高赞的 1 个视频作为网路加载过渡
+        if (newList.isEmpty() && !lowLike.isEmpty()) {
+            newList.add(lowLike.get(0));
+            long topDigg = -1;
+            try { topDigg = getDiggCount(lowLike.get(0)); } catch (Throwable ignored) {}
+            XposedBridge.log(TAG + ": [极度严格防死锁] 本批 " + originalSize + " 个视频均低于 " + minLike + " 赞，仅保留最高赞 1 个视频过渡(点赞=" + topDigg + ")");
         }
 
         int removedCount = originalSize - newList.size();
 
         if (removedCount > 0) {
-            XposedBridge.log(TAG + ": [动态预加载优化] 本批 " + originalSize + " 个视频，达标 " + qualified.size() + " 个，补充最高赞 " + Math.max(0, needed) + " 个缓冲，最终过滤 " + removedCount + " 个，保留 " + newList.size() + " 个");
+            XposedBridge.log(TAG + ": [极度严格过滤] 本批 " + originalSize + " 个视频，达标 " + qualified.size() + " 个，过滤 " + removedCount + " 个低赞视频，最终保留 " + newList.size() + " 个");
         }
 
         if (removedCount > 0) {
@@ -452,13 +437,28 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    private boolean isSpecialNonVideoItem(Object aweme) {
+        try {
+            if (XposedHelpers.getBooleanField(aweme, "isLive")) return true;
+        } catch (Throwable ignored) {}
+        try {
+            if (XposedHelpers.getBooleanField(aweme, "isAd")) return true;
+        } catch (Throwable ignored) {}
+        try {
+            Object liveRoom = XposedHelpers.getObjectField(aweme, "liveRoom");
+            if (liveRoom != null) return true;
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
     // ─────────────────────────────────────────────────────────────
-    // ★ 工具方法
+    // ★ 工具方法：继承链深搜点赞数
     // ─────────────────────────────────────────────────────────────
 
     private long getDiggCount(Object aweme) throws Throwable {
         if (aweme == null) return -1;
 
+        // 1. Aweme 直接方法与字段
         try {
             Method m = aweme.getClass().getMethod("getDiggCount");
             Object r = m.invoke(aweme);
@@ -466,9 +466,25 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable ignored) {}
 
         try {
-            return XposedHelpers.getLongField(aweme, "diggCount");
+            Method m = aweme.getClass().getMethod("LIZIZ");
+            if (m.getReturnType() == long.class || m.getReturnType() == Long.class) {
+                Object r = m.invoke(aweme);
+                if (r instanceof Number) return ((Number) r).longValue();
+            }
         } catch (Throwable ignored) {}
 
+        Class<?> awemeClz = aweme.getClass();
+        while (awemeClz != null && awemeClz != Object.class) {
+            try {
+                Field f = awemeClz.getDeclaredField("diggCount");
+                f.setAccessible(true);
+                Object val = f.get(aweme);
+                if (val instanceof Number) return ((Number) val).longValue();
+            } catch (Throwable ignored) {}
+            awemeClz = awemeClz.getSuperclass();
+        }
+
+        // 2. AwemeStatistics 统计对象
         Object statistics = null;
         try {
             statistics = XposedHelpers.getObjectField(aweme, "statistics");
@@ -481,14 +497,11 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if (statistics == null) return -1;
 
+        // 2a. 方法检索 (getDiggCount / LIZIZ)
         try {
             Method m = statistics.getClass().getMethod("getDiggCount");
             Object r = m.invoke(statistics);
             if (r instanceof Number) return ((Number) r).longValue();
-        } catch (Throwable ignored) {}
-
-        try {
-            return XposedHelpers.getLongField(statistics, "diggCount");
         } catch (Throwable ignored) {}
 
         try {
@@ -499,27 +512,42 @@ public class MainHook implements IXposedHookLoadPackage {
             }
         } catch (Throwable ignored) {}
 
-        try {
-            Field f = statistics.getClass().getDeclaredField("b");
-            f.setAccessible(true);
-            if (f.getType() == long.class || f.getType() == Long.class) {
-                Object val = f.get(statistics);
-                if (val instanceof Number) return ((Number) val).longValue();
-            }
-        } catch (Throwable ignored) {}
+        // 2b. 继承链深度检索字段 (b / diggCount / digg关键词)
+        Class<?> statClz = statistics.getClass();
+        while (statClz != null && statClz != Object.class) {
+            try {
+                Field f = statClz.getDeclaredField("b");
+                f.setAccessible(true);
+                if (f.getType() == long.class || f.getType() == Long.class) {
+                    Object val = f.get(statistics);
+                    if (val instanceof Number) return ((Number) val).longValue();
+                }
+            } catch (Throwable ignored) {}
 
-        try {
-            for (Field field : statistics.getClass().getDeclaredFields()) {
-                field.setAccessible(true);
-                if (field.getType() == long.class || field.getType() == Long.class) {
-                    String name = field.getName().toLowerCase();
-                    if (name.contains("digg") || name.contains("like")) {
-                        Object val = field.get(statistics);
-                        if (val instanceof Number) return ((Number) val).longValue();
+            try {
+                Field f = statClz.getDeclaredField("diggCount");
+                f.setAccessible(true);
+                if (f.getType() == long.class || f.getType() == Long.class) {
+                    Object val = f.get(statistics);
+                    if (val instanceof Number) return ((Number) val).longValue();
+                }
+            } catch (Throwable ignored) {}
+
+            try {
+                for (Field field : statClz.getDeclaredFields()) {
+                    field.setAccessible(true);
+                    if (field.getType() == long.class || field.getType() == Long.class) {
+                        String name = field.getName().toLowerCase();
+                        if (name.contains("digg") || name.contains("like")) {
+                            Object val = field.get(statistics);
+                            if (val instanceof Number) return ((Number) val).longValue();
+                        }
                     }
                 }
-            }
-        } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {}
+
+            statClz = statClz.getSuperclass();
+        }
 
         return -1;
     }
