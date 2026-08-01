@@ -409,12 +409,18 @@ public class MainHook implements IXposedHookLoadPackage {
 
         List<Object> newList = new ArrayList<>(qualified);
 
-        // 极度严格模式防死锁：仅当整个批次无一视频达标时，才保留本批最高赞的 1 个视频作为网路加载过渡
+        // 智能平滑缓冲模式：
+        // 1. 如果本批有达标视频 (newList 不为空)，保留所有达标视频，不混入低赞视频；
+        // 2. 如果本批无达标视频 (newList 为空)，保留该批中点赞最高的前 2 个视频作为缓冲桥梁，
+        //    确保播放器能够持续触发后台预下载，彻底消除频繁卡顿/转圈现象！
         if (newList.isEmpty() && !lowLike.isEmpty()) {
-            newList.add(lowLike.get(0));
+            int retainBridgeCount = Math.min(2, lowLike.size());
+            for (int i = 0; i < retainBridgeCount; i++) {
+                newList.add(lowLike.get(i));
+            }
             long topDigg = -1;
             try { topDigg = getDiggCount(lowLike.get(0)); } catch (Throwable ignored) {}
-            XposedBridge.log(TAG + ": [极度严格防死锁] 本批 " + originalSize + " 个视频均低于 " + minLike + " 赞，仅保留最高赞 1 个视频过渡(点赞=" + topDigg + ")");
+            XposedBridge.log(TAG + ": [智能平滑缓冲] 本批 " + originalSize + " 个视频均低于 " + minLike + " 赞，补充最高赞 " + retainBridgeCount + " 个视频做缓冲桥梁(最高赞=" + topDigg + ")");
         }
 
         int removedCount = originalSize - newList.size();
