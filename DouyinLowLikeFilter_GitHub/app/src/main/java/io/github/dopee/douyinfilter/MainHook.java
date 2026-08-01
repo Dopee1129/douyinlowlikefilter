@@ -46,8 +46,8 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KEY_MIN_LIKE = "min_like_count";
     private static final int DEFAULT_MIN_LIKE = 1000;
 
-    // 预加载缓冲保持数量：至少保留 2 个视频给播放器进行后台预缓冲，避免上滑秒变转圈加载
-    private static final int MIN_RETAIN_COUNT = 2;
+    // 预加载缓冲保持数量：至少保留 3 个视频给播放器进行后台预缓冲，彻底消除高阈值下由于预加载队列过短导致的等待
+    private static final int MIN_RETAIN_COUNT = 3;
 
     // 运行时缓存（避免每次过滤都读磁盘）
     private volatile int cachedMinLike = DEFAULT_MIN_LIKE;
