@@ -17,7 +17,6 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.WeakHashMap;
@@ -299,7 +298,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ★ 过滤逻辑：优化无死锁连刷与单次过滤防重
+    // ★ 过滤逻辑：全新非变异 List 构建，彻底解决 ConcurrentModificationException
     // ─────────────────────────────────────────────────────────────
 
     private void hookFeedItemList(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -320,15 +319,10 @@ public class MainHook implements IXposedHookLoadPackage {
                             new XC_MethodHook() {
                                 @Override
                                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                                    List<?> list = (List<?>) param.getResult();
-                                    if (list == null || list.isEmpty()) return;
+                                    List<?> originalList = (List<?>) param.getResult();
+                                    if (originalList == null || originalList.isEmpty()) return;
 
-                                    if (!isModifiableList(list)) {
-                                        list = new ArrayList<>(list);
-                                        param.setResult(list);
-                                    }
-
-                                    filterAwemeList(param.thisObject, list);
+                                    filterAwemeList(param, originalList);
                                 }
                             }
                     );
@@ -350,15 +344,10 @@ public class MainHook implements IXposedHookLoadPackage {
                         XposedBridge.hookMethod(m, new XC_MethodHook() {
                             @Override
                             protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                                List<?> list = (List<?>) param.getResult();
-                                if (list == null || list.isEmpty()) return;
+                                List<?> originalList = (List<?>) param.getResult();
+                                if (originalList == null || originalList.isEmpty()) return;
 
-                                if (!isModifiableList(list)) {
-                                    list = new ArrayList<>(list);
-                                    param.setResult(list);
-                                }
-
-                                filterAwemeList(param.thisObject, list);
+                                filterAwemeList(param, originalList);
                             }
                         });
                     }
@@ -369,15 +358,16 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /**
      * 核心过滤算法：
-     * 1. 过滤低于 minLike 的视频
-     * 2. 防止整批视频全被滤空导致抖音客户端死锁无法滑动：若该批次全低于阈值，保留该批中点赞最高的一个视频，确保可滑动并触发下一页加载
-     * 3. 同一 FeedItemList 实例仅处理一次，避免重复遍历
+     * 1. 拷贝过滤：构造【全新】newList，绝不在原始 originalList 上直接调用 remove()/add()，彻底杜绝 ConcurrentModificationException。
+     * 2. 防卡死兜底：若该批次全低于阈值，保留该批中点赞最高的一个视频，确保可滑动并触发下一页加载。
+     * 3. 去重控制：同一 FeedItemList 实例仅处理一次。
      */
     @SuppressWarnings("unchecked")
-    private void filterAwemeList(Object feedItemList, List<?> list) {
-        if (list == null || list.isEmpty()) return;
+    private void filterAwemeList(XC_MethodHook.MethodHookParam param, List<?> originalList) {
+        if (originalList == null || originalList.isEmpty()) return;
         if (!isRecommendPage()) return;
 
+        Object feedItemList = param.thisObject;
         if (feedItemList != null && processedFeedLists.contains(feedItemList)) {
             return;
         }
@@ -385,11 +375,12 @@ public class MainHook implements IXposedHookLoadPackage {
         int minLike = cachedMinLike;
         if (minLike <= 0) return;
 
-        int originalSize = list.size();
+        int originalSize = originalList.size();
         long maxDiggFound = -1;
         Object bestAweme = null;
 
-        for (Object aweme : list) {
+        // 1. 遍历原列表，记录点赞最高视频 (防卡死兜底)
+        for (Object aweme : originalList) {
             if (aweme == null) continue;
             try {
                 long digg = getDiggCount(aweme);
@@ -400,26 +391,40 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {}
         }
 
+        // 2. 构建全新 List，不修改原 list 指针与内容（彻底避免并发修改异常！）
+        List<Object> newList = new ArrayList<>(originalSize);
         int removedCount = 0;
-        Iterator<?> it = list.iterator();
-        while (it.hasNext()) {
-            Object aweme = it.next();
+
+        for (Object aweme : originalList) {
             if (aweme == null) continue;
             try {
                 long diggCount = getDiggCount(aweme);
                 if (diggCount >= 0 && diggCount < minLike) {
-                    it.remove();
                     removedCount++;
+                } else {
+                    newList.add(aweme);
                 }
-            } catch (Throwable ignored) {}
+            } catch (Throwable t) {
+                newList.add(aweme);
+            }
         }
 
-        // 兜底策略：如果整批视频全部低于阈值，保留该批次中点赞最高的那个视频
-        if (list.isEmpty() && bestAweme != null) {
-            ((List<Object>) list).add(bestAweme);
+        // 3. 防卡死兜底：如果整批视频全部低于阈值，保留该批次中点赞最高的那个视频
+        if (newList.isEmpty() && bestAweme != null) {
+            newList.add(bestAweme);
             XposedBridge.log(TAG + ": [防卡死] 本批 " + originalSize + " 个视频全部低于 " + minLike + " 赞，保留最高赞视频(点赞=" + maxDiggFound + ")");
         } else if (removedCount > 0) {
-            XposedBridge.log(TAG + ": 过滤 " + removedCount + "/" + originalSize + " 个低赞视频，剩余 " + list.size() + " 个");
+            XposedBridge.log(TAG + ": 过滤 " + removedCount + "/" + originalSize + " 个低赞视频，剩余 " + newList.size() + " 个");
+        }
+
+        // 4. 将全新 newList 替换为返回值与成员变量
+        if (removedCount > 0 || (newList.isEmpty() && bestAweme != null)) {
+            param.setResult(newList);
+            if (feedItemList != null) {
+                try {
+                    XposedHelpers.setObjectField(feedItemList, "items", newList);
+                } catch (Throwable ignored) {}
+            }
         }
 
         if (feedItemList != null) {
@@ -497,16 +502,6 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable ignored) {}
 
         return -1;
-    }
-
-    private boolean isModifiableList(List<?> list) {
-        try {
-            list.add(0, null);
-            list.remove(0);
-            return true;
-        } catch (Throwable t) {
-            return false;
-        }
     }
 
     private boolean isRecommendPage() {
