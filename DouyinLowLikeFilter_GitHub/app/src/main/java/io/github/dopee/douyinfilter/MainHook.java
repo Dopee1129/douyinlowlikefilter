@@ -584,7 +584,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ★ 过滤逻辑（和之前一样，只是读值改为读内存缓存）
+    // ★ 过滤逻辑
     // ─────────────────────────────────────────────────────────────
 
     private void hookFeedItemList(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -593,8 +593,9 @@ public class MainHook implements IXposedHookLoadPackage {
                 "com.ss.android.ugc.aweme.feed.model.AwemeList",
                 "com.ss.android.ugc.aweme.feed.feedlist.FeedItemList"
         };
-        String[] methodNames = {"getItems", "getAwemeList", "getList"};
+        String[] methodNames = {"getItems", "getItemsP", "getItemsNotNull", "getAwemeList", "getList"};
 
+        int hookedCount = 0;
         for (String className : classNames) {
             for (String methodName : methodNames) {
                 try {
@@ -611,7 +612,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                     if (list == null || list.isEmpty()) return;
 
                                     int minLike = cachedMinLike;
-                                    XposedBridge.log(TAG + ": [FeedItemList] 开始过滤，当前阈值 = " + minLike);
+                                    XposedBridge.log(TAG + ": [FeedItemList." + param.method.getName() + "] 触发过滤，当前阈值 = " + minLike + "，列表数量 = " + list.size());
 
                                     if (!isModifiableList(list)) {
                                         list = new ArrayList<>(list);
@@ -625,7 +626,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                         if (aweme == null) continue;
                                         try {
                                             long diggCount = getDiggCount(aweme);
-                                            if (diggCount < minLike) {
+                                            if (diggCount >= 0 && diggCount < minLike) {
                                                 it.remove();
                                                 removedCount++;
                                                 XposedBridge.log(TAG + ": 过滤视频，点赞数=" + diggCount + " < " + minLike);
@@ -634,17 +635,17 @@ public class MainHook implements IXposedHookLoadPackage {
                                     }
 
                                     if (removedCount > 0) {
-                                        XposedBridge.log(TAG + ": 本次过滤 " + removedCount + " 个低赞视频");
+                                        XposedBridge.log(TAG + ": 本次过滤 " + removedCount + " 个低赞视频，剩余 " + list.size() + " 个");
                                     }
                                 }
                             }
                     );
+                    hookedCount++;
                     XposedBridge.log(TAG + ": Hook 成功 -> " + className + "." + methodName + "()");
-                    return;
                 } catch (Throwable ignored) {}
             }
         }
-        throw new RuntimeException("未找到可用的 Hook 点");
+        XposedBridge.log(TAG + ": FeedItemList 完成注册 " + hookedCount + " 个 Hook 点");
     }
 
     private void hookFeedModel(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -674,7 +675,7 @@ public class MainHook implements IXposedHookLoadPackage {
                                     if (aweme == null) continue;
                                     try {
                                         long diggCount = getDiggCount(aweme);
-                                        if (diggCount < minLike) {
+                                        if (diggCount >= 0 && diggCount < minLike) {
                                             it.remove();
                                             XposedBridge.log(TAG + ": [FeedModel] 过滤，点赞数=" + diggCount + " < " + minLike);
                                         }
@@ -683,7 +684,6 @@ public class MainHook implements IXposedHookLoadPackage {
                             }
                         });
                         XposedBridge.log(TAG + ": FeedModel Hook 成功 -> " + className + "." + m.getName() + "()");
-                        return;
                     }
                 }
             } catch (Throwable ignored) {}
@@ -724,12 +724,10 @@ public class MainHook implements IXposedHookLoadPackage {
     private void hookFeedResponseParser(XC_LoadPackage.LoadPackageParam lpparam) {
         XposedBridge.log(TAG + ": 尝试 Hook Feed 响应解析...");
 
-        // 方案1: Hook Retrofit 的 Converter 转换方法
         try {
             Class<?> responseClass = XposedHelpers.findClass(
                     "com.ss.android.ugc.aweme.feed.model.FeedResponse", lpparam.classLoader);
 
-            // Hook FeedResponse 的构造函数或解析方法
             XposedHelpers.findAndHookConstructor(responseClass, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
@@ -737,63 +735,15 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
             XposedBridge.log(TAG + ": FeedResponse 构造函数 Hook 成功");
-            return;
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": FeedResponse Hook 失败: " + t.getMessage());
         }
-
-        // 方案2: Hook 通用的 JSON 解析回调
-        try {
-            XposedHelpers.findAndHookMethod(
-                    "com.google.gson.Gson",
-                    lpparam.classLoader,
-                    "fromJson",
-                    String.class,
-                    java.lang.reflect.Type.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                            Object result = param.getResult();
-                            if (result == null) return;
-
-                            String className = result.getClass().getName();
-                            // 检测 Feed 相关的响应类
-                            if (className.contains("FeedResponse") ||
-                                    className.contains("AwemeList") ||
-                                    className.contains("FeedItemList")) {
-
-                                // 尝试获取 items 列表并过滤
-                                try {
-                                    Object items = XposedHelpers.getObjectField(result, "items");
-                                    if (items == null) {
-                                        items = XposedHelpers.getObjectField(result, "awemeList");
-                                    }
-                                    if (items == null) {
-                                        items = XposedHelpers.getObjectField(result, "data");
-                                    }
-
-                                    if (items instanceof List) {
-                                        filterListAtParser((List<?>) items, className);
-                                    }
-                                } catch (Throwable ignored) {}
-                            }
-                        }
-                    }
-            );
-            XposedBridge.log(TAG + ": Gson Type Hook 成功（预加载）");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Gson Type Hook 失败: " + t.getMessage());
-        }
     }
 
-    /**
-     * 在解析阶段过滤 FeedResponse 对象
-     */
     private void filterFeedResponse(Object feedResponse) {
         try {
             if (!isRecommendPageFromResponse(feedResponse)) return;
 
-            // 尝试获取视频列表字段
             List<?> items = null;
             try {
                 items = (List<?>) XposedHelpers.getObjectField(feedResponse, "items");
@@ -819,34 +769,27 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * 在解析阶段过滤列表（比列表填充更早）
-     */
     @SuppressWarnings("unchecked")
     private void filterListAtParser(List<?> list, String source) {
         if (list == null || list.isEmpty()) return;
 
-        // 使用更宽松的页面检测，因为解析阶段调用栈可能不同
         if (!isLikelyRecommendFeed()) return;
 
         int minLike = cachedMinLike;
         int removedCount = 0;
         int totalCount = list.size();
 
-        // 使用 Iterator 安全地删除元素
         Iterator<?> it = list.iterator();
         while (it.hasNext()) {
             Object aweme = it.next();
             if (aweme == null) continue;
             try {
                 long diggCount = getDiggCount(aweme);
-                if (diggCount < minLike) {
+                if (diggCount >= 0 && diggCount < minLike) {
                     it.remove();
                     removedCount++;
                 }
-            } catch (Throwable ignored) {
-                // 如果获取点赞数失败，保留该视频（避免误杀）
-            }
+            } catch (Throwable ignored) {}
         }
 
         if (removedCount > 0) {
@@ -854,42 +797,12 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /**
-     * 基于响应对象判断是否是推荐页（备用方案）
-     */
     private boolean isRecommendPageFromResponse(Object response) {
-        try {
-            // 尝试从响应对象中获取 feedType 或类似字段
-            // 如果获取不到，默认按推荐页处理（因为大部分请求都是推荐页）
-            return true;
-        } catch (Throwable t) {
-            return true;
-        }
+        return true;
     }
 
-    /**
-     * 宽松的推荐页检测（用于解析阶段）
-     */
     private boolean isLikelyRecommendFeed() {
-        try {
-            StackTraceElement[] stack = Thread.currentThread().getStackTrace();
-            String[] recommendKeywords = {"homepage", "homefeed", "recommend", "hot", "mainfeed", "feed", "refresh"};
-            String[] excludeKeywords = {"following", "favorite", "collect", "search", "message", "profile", "discover", "account", "user"};
-
-            for (StackTraceElement e : stack) {
-                String cn = e.getClassName().toLowerCase();
-                for (String kw : excludeKeywords) {
-                    if (cn.contains(kw)) return false;
-                }
-                for (String kw : recommendKeywords) {
-                    if (cn.contains(kw)) return true;
-                }
-            }
-            // 解析阶段调用栈可能不明确，默认返回 true（大部分请求是推荐页）
-            return true;
-        } catch (Throwable t) {
-            return true;
-        }
+        return isRecommendPage();
     }
 
     private void filterListDirect(List<?> list) {
@@ -902,7 +815,7 @@ public class MainHook implements IXposedHookLoadPackage {
             if (aweme == null) continue;
             try {
                 long diggCount = getDiggCount(aweme);
-                if (diggCount < minLike) {
+                if (diggCount >= 0 && diggCount < minLike) {
                     it.remove();
                     XposedBridge.log(TAG + ": [Gson兜底] 过滤，点赞数=" + diggCount + " < " + minLike);
                 }
@@ -911,10 +824,33 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ★ 工具方法
+    // ★ 工具方法：适配 39.8.0 混淆与调用栈
     // ─────────────────────────────────────────────────────────────
 
+    /**
+     * 适配最新版抖音（如 39.8.0）获取视频点赞数
+     * 1. 尝试直接获取 aweme.getDiggCount() / aweme.diggCount
+     * 2. 获取 aweme.statistics (AwemeStatistics)
+     * 3. 尝试 statistics.getDiggCount() / statistics.diggCount
+     * 4. 尝试 39.8.0 混淆方法 statistics.LIZIZ()
+     * 5. 尝试 39.8.0 混淆字段 statistics.b (long)
+     * 6. 反射遍历 long 字段兜底
+     */
     private long getDiggCount(Object aweme) throws Throwable {
+        if (aweme == null) return -1;
+
+        // 1. Direct Aweme field / method
+        try {
+            Method m = aweme.getClass().getMethod("getDiggCount");
+            Object r = m.invoke(aweme);
+            if (r instanceof Number) return ((Number) r).longValue();
+        } catch (Throwable ignored) {}
+
+        try {
+            return XposedHelpers.getLongField(aweme, "diggCount");
+        } catch (Throwable ignored) {}
+
+        // 2. AwemeStatistics
         Object statistics = null;
         try {
             statistics = XposedHelpers.getObjectField(aweme, "statistics");
@@ -925,20 +861,40 @@ public class MainHook implements IXposedHookLoadPackage {
             } catch (Throwable ignored) {}
         }
 
-        if (statistics == null) {
-            try { return XposedHelpers.getLongField(aweme, "diggCount"); } catch (Throwable ignored) {}
-            return 0;
-        }
+        if (statistics == null) return -1;
 
-        try { return XposedHelpers.getLongField(statistics, "diggCount"); } catch (Throwable ignored) {}
-
+        // 2a. statistics.getDiggCount()
         try {
             Method m = statistics.getClass().getMethod("getDiggCount");
             Object r = m.invoke(statistics);
-            if (r instanceof Long) return (Long) r;
-            if (r instanceof Integer) return ((Integer) r).longValue();
+            if (r instanceof Number) return ((Number) r).longValue();
         } catch (Throwable ignored) {}
 
+        // 2b. statistics.diggCount
+        try {
+            return XposedHelpers.getLongField(statistics, "diggCount");
+        } catch (Throwable ignored) {}
+
+        // 2c. 抖音 39.8.0 混淆 getter: LIZIZ()
+        try {
+            Method m = statistics.getClass().getMethod("LIZIZ");
+            if (m.getReturnType() == long.class || m.getReturnType() == Long.class) {
+                Object r = m.invoke(statistics);
+                if (r instanceof Number) return ((Number) r).longValue();
+            }
+        } catch (Throwable ignored) {}
+
+        // 2d. 抖音 39.8.0 混淆字段: b (long)
+        try {
+            Field f = statistics.getClass().getDeclaredField("b");
+            f.setAccessible(true);
+            if (f.getType() == long.class || f.getType() == Long.class) {
+                Object val = f.get(statistics);
+                if (val instanceof Number) return ((Number) val).longValue();
+            }
+        } catch (Throwable ignored) {}
+
+        // 2e. 兜底反射遍历
         try {
             for (Field field : statistics.getClass().getDeclaredFields()) {
                 field.setAccessible(true);
@@ -946,14 +902,13 @@ public class MainHook implements IXposedHookLoadPackage {
                     String name = field.getName().toLowerCase();
                     if (name.contains("digg") || name.contains("like")) {
                         Object val = field.get(statistics);
-                        if (val instanceof Long) return (Long) val;
-                        if (val instanceof Integer) return ((Integer) val).longValue();
+                        if (val instanceof Number) return ((Number) val).longValue();
                     }
                 }
             }
         } catch (Throwable ignored) {}
 
-        return 0;
+        return -1;
     }
 
     private boolean isModifiableList(List<?> list) {
@@ -968,27 +923,27 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /**
      * 判断是否是推荐页（基于调用栈分析）
+     * 针对 39.8.0 混淆优化：
+     * 如果调用栈明确出现 search/profile/following/favorite 等非推荐页特征，则排除；
+     * 若未出现排除特征（包括混淆/异步后台线程调用栈），默认认为是推荐页并允许过滤。
      */
     private boolean isRecommendPage() {
         try {
             StackTraceElement[] stack = Thread.currentThread().getStackTrace();
-            String[] recommendKeywords = {"homepage", "homefeed", "recommend", "hot", "mainfeed", "feedlist", "refresh", "pulldown"};
             String[] excludeKeywords = {"following", "favorite", "collect", "search", "message", "profile", "discover", "account"};
 
             for (StackTraceElement e : stack) {
                 String cn = e.getClassName().toLowerCase();
                 for (String kw : excludeKeywords) {
-                    if (cn.contains(kw)) return false;
-                }
-                for (String kw : recommendKeywords) {
                     if (cn.contains(kw)) {
-                        return true;
+                        return false;
                     }
                 }
             }
-            return false;
+            // 异步后台线程或混淆调用栈下默认允许过滤
+            return true;
         } catch (Throwable t) {
-            return false;
+            return true;
         }
     }
 }
