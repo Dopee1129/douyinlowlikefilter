@@ -46,6 +46,9 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String KEY_MIN_LIKE = "min_like_count";
     private static final int DEFAULT_MIN_LIKE = 1000;
 
+    // 预加载缓冲保持数量：至少保留 2 个视频给播放器进行后台预缓冲，避免上滑秒变转圈加载
+    private static final int MIN_RETAIN_COUNT = 2;
+
     // 运行时缓存（避免每次过滤都读磁盘）
     private volatile int cachedMinLike = DEFAULT_MIN_LIKE;
     // 保存抖音 Context 供后续使用
@@ -298,7 +301,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // ★ 过滤逻辑：全新非变异 List 构建，彻底解决 ConcurrentModificationException
+    // ★ 过滤逻辑：智能预加载缓冲 + 全新 List 构建
     // ─────────────────────────────────────────────────────────────
 
     private void hookFeedItemList(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -358,9 +361,11 @@ public class MainHook implements IXposedHookLoadPackage {
 
     /**
      * 核心过滤算法：
-     * 1. 拷贝过滤：构造【全新】newList，绝不在原始 originalList 上直接调用 remove()/add()，彻底杜绝 ConcurrentModificationException。
-     * 2. 防卡死兜底：若该批次全低于阈值，保留该批中点赞最高的一个视频，确保可滑动并触发下一页加载。
-     * 3. 去重控制：同一 FeedItemList 实例仅处理一次。
+     * 1. 分流达标 (>= minLike) 与低赞 (< minLike) 视频
+     * 2. 低赞视频按点赞数降序排列
+     * 3. 预加载缓冲保持：确保每次给播放器至少保留 MIN_RETAIN_COUNT (2) 个视频
+     *    当本批达标视频不足 2 个时，自动补充低赞列表中相对最高赞的视频作为缓冲桥梁，
+     *    使得抖音底层预加载引擎（Preloader）能够持续缓冲下一条视频，彻底解决滑动卡顿转圈问题！
      */
     @SuppressWarnings("unchecked")
     private void filterAwemeList(XC_MethodHook.MethodHookParam param, List<?> originalList) {
@@ -376,49 +381,54 @@ public class MainHook implements IXposedHookLoadPackage {
         if (minLike <= 0) return;
 
         int originalSize = originalList.size();
-        long maxDiggFound = -1;
-        Object bestAweme = null;
 
-        // 1. 遍历原列表，记录点赞最高视频 (防卡死兜底)
-        for (Object aweme : originalList) {
-            if (aweme == null) continue;
-            try {
-                long digg = getDiggCount(aweme);
-                if (digg > maxDiggFound) {
-                    maxDiggFound = digg;
-                    bestAweme = aweme;
-                }
-            } catch (Throwable ignored) {}
-        }
-
-        // 2. 构建全新 List，不修改原 list 指针与内容（彻底避免并发修改异常！）
-        List<Object> newList = new ArrayList<>(originalSize);
-        int removedCount = 0;
+        List<Object> qualified = new ArrayList<>(originalSize);
+        List<Object> lowLike = new ArrayList<>(originalSize);
 
         for (Object aweme : originalList) {
             if (aweme == null) continue;
             try {
                 long diggCount = getDiggCount(aweme);
-                if (diggCount >= 0 && diggCount < minLike) {
-                    removedCount++;
+                if (diggCount >= minLike || diggCount < 0) {
+                    qualified.add(aweme);
                 } else {
-                    newList.add(aweme);
+                    lowLike.add(aweme);
                 }
             } catch (Throwable t) {
-                newList.add(aweme);
+                qualified.add(aweme);
             }
         }
 
-        // 3. 防卡死兜底：如果整批视频全部低于阈值，保留该批次中点赞最高的那个视频
-        if (newList.isEmpty() && bestAweme != null) {
-            newList.add(bestAweme);
-            XposedBridge.log(TAG + ": [防卡死] 本批 " + originalSize + " 个视频全部低于 " + minLike + " 赞，保留最高赞视频(点赞=" + maxDiggFound + ")");
-        } else if (removedCount > 0) {
-            XposedBridge.log(TAG + ": 过滤 " + removedCount + "/" + originalSize + " 个低赞视频，剩余 " + newList.size() + " 个");
+        // 按点赞数从高到低排序 lowLike
+        Collections.sort(lowLike, (a, b) -> {
+            try {
+                long diggA = getDiggCount(a);
+                long diggB = getDiggCount(b);
+                return Long.compare(diggB, diggA);
+            } catch (Throwable t) {
+                return 0;
+            }
+        });
+
+        // 构造 final 输出 list
+        List<Object> newList = new ArrayList<>(qualified);
+
+        int targetRetain = Math.min(MIN_RETAIN_COUNT, originalSize);
+        int needed = targetRetain - newList.size();
+
+        if (needed > 0 && !lowLike.isEmpty()) {
+            for (int i = 0; i < Math.min(needed, lowLike.size()); i++) {
+                newList.add(lowLike.get(i));
+            }
         }
 
-        // 4. 将全新 newList 替换为返回值与成员变量
-        if (removedCount > 0 || (newList.isEmpty() && bestAweme != null)) {
+        int removedCount = originalSize - newList.size();
+
+        if (removedCount > 0) {
+            XposedBridge.log(TAG + ": [预加载优化] 本批 " + originalSize + " 个视频，达标 " + qualified.size() + " 个，补充最高赞 " + Math.max(0, needed) + " 个缓冲，最终过滤 " + removedCount + " 个，保留 " + newList.size() + " 个");
+        }
+
+        if (removedCount > 0) {
             param.setResult(newList);
             if (feedItemList != null) {
                 try {
